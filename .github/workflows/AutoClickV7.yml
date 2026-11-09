@@ -1,0 +1,1922 @@
+name: Build APK v2
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-apk
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.9
+
+      - name: Limpiar proyecto viejo
+        run: |
+          rm -rf app build.gradle.kts settings.gradle.kts gradle.properties
+
+      - name: Crear archivos del proyecto
+        run: |
+          mkdir -p "$(dirname 'app/build.gradle.kts')"
+          cat > 'app/build.gradle.kts' <<'FIN_ARCHIVO_0'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.autoprompter"
+              compileSdk = 34
+
+              defaultConfig {
+                  applicationId = "com.autoprompter"
+                  minSdk = 24
+                  targetSdk = 34
+                  versionCode = 5
+                  versionName = "2.3"
+              }
+
+              buildTypes {
+                  release { isMinifyEnabled = false }
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+
+          dependencies {
+              implementation("com.google.android.material:material:1.12.0")
+              implementation("androidx.appcompat:appcompat:1.6.1")
+              implementation("androidx.core:core-ktx:1.12.0")
+              implementation("com.google.code.gson:gson:2.10.1")
+          }
+          FIN_ARCHIVO_0
+          mkdir -p "$(dirname 'app/src/main/AndroidManifest.xml')"
+          cat > 'app/src/main/AndroidManifest.xml' <<'FIN_ARCHIVO_1'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
+              <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" />
+              <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="29" />
+
+              <application
+                  android:allowBackup="false"
+                  android:label="@string/app_name"
+                  android:requestLegacyExternalStorage="true"
+                  android:theme="@style/AppTheme">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:windowSoftInputMode="adjustResize">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".ClickService"
+                      android:exported="true"
+                      android:label="@string/app_name"
+                      android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+                      <intent-filter>
+                          <action android:name="android.accessibilityservice.AccessibilityService" />
+                      </intent-filter>
+                      <meta-data
+                          android:name="android.accessibilityservice"
+                          android:resource="@xml/accessibility_config" />
+                  </service>
+              </application>
+          </manifest>
+          FIN_ARCHIVO_1
+          mkdir -p "$(dirname 'app/src/main/java/com/autoprompter/ClickService.kt')"
+          cat > 'app/src/main/java/com/autoprompter/ClickService.kt' <<'FIN_ARCHIVO_2'
+          package com.autoprompter
+
+          import android.accessibilityservice.AccessibilityService
+          import android.accessibilityservice.GestureDescription
+          import android.content.Intent
+          import android.graphics.Color
+          import android.graphics.Path
+          import android.graphics.PixelFormat
+          import android.graphics.Rect
+          import android.os.Bundle
+          import android.os.Handler
+          import android.os.Looper
+          import android.util.Log
+          import android.view.Gravity
+          import android.view.MotionEvent
+          import android.view.View
+          import android.view.ViewConfiguration
+          import android.view.WindowManager
+          import android.view.accessibility.AccessibilityEvent
+          import android.view.accessibility.AccessibilityNodeInfo
+          import android.widget.Button
+          import android.widget.LinearLayout
+          import android.widget.Toast
+          import java.io.File
+          import java.util.concurrent.CountDownLatch
+          import java.util.concurrent.TimeUnit
+          import java.util.concurrent.atomic.AtomicBoolean
+
+          class ClickService : AccessibilityService() {
+
+              companion object {
+                  @Volatile
+                  var instance: ClickService? = null
+              }
+
+              private val main = Handler(Looper.getMainLooper())
+
+              // running = el trabajo esta en marcha; armed = esperando que se pulse PLAY
+              @Volatile private var running = false
+              @Volatile private var armed = false
+              @Volatile private var worker: Thread? = null
+              private var overlay: View? = null
+
+              // Ultima posicion del panel (offset desde arriba y desde la derecha), para que no salte al pulsar PLAY
+              private var panelX = 0
+              private var panelY = 120
+
+              override fun onServiceConnected() {
+                  super.onServiceConnected()
+                  Logger.init(this)
+                  instance = this
+                  Logger.log("Servicio de accesibilidad conectado")
+              }
+
+              override fun onAccessibilityEvent(event: AccessibilityEvent?) {}
+              override fun onInterrupt() {}
+
+              override fun onUnbind(intent: Intent?): Boolean {
+                  stopRun("Servicio desconectado")
+                  instance = null
+                  return super.onUnbind(intent)
+              }
+
+              // ---------- API publica ----------
+
+              /** Devuelve true si el flujo fue aceptado (arrancado o esperando PLAY). */
+              fun startFlow(flow: Flow): Boolean {
+                  if (running) {
+                      toast("Ya hay un flujo corriendo. Pulsa DETENER para pararlo.")
+                      return false
+                  }
+                  if (flow.useFloatingButton) {
+                      armed = true
+                      showPanel(flow, true)
+                  } else {
+                      beginRun(flow)
+                  }
+                  return true
+              }
+
+              fun stopRun(reason: String) {
+                  val wasActive = running || armed
+                  running = false
+                  armed = false
+                  if (wasActive) Logger.log(reason)
+                  val w = worker
+                  worker = null
+                  w?.interrupt()
+                  hideOverlay()
+              }
+
+              // ---------- control del trabajo ----------
+
+              private fun beginRun(flow: Flow) {
+                  if (running) return
+                  armed = false
+                  running = true
+                  showPanel(flow, false)
+                  val t = Thread { runJob(flow) }
+                  worker = t
+                  t.start()
+              }
+
+              /** Solo el hilo vigente puede dar por terminado el trabajo. */
+              private fun finishRun(me: Thread, reason: String) {
+                  if (worker === me) stopRun(reason)
+              }
+
+              private fun alive(): Boolean = running && Thread.currentThread() === worker
+
+              private fun runJob(flow: Flow) {
+                  val me = Thread.currentThread()
+                  try {
+                      val prompts = parsePromptList(flow.promptList())
+                      if (prompts.isEmpty()) {
+                          Logger.log("Lista de prompts vacia o mal formada")
+                          finishRun(me, "Lista vacia")
+                          toast("La lista de prompts esta vacia o mal formada")
+                          return
+                      }
+                      Logger.log("INICIO flujo ${flow.name}: ${prompts.size} prompts, espera inicial ${flow.waitBeforeStart}s")
+                      if (!pause(flow.waitBeforeStart * 1000L)) return
+
+                      for (p in prompts) {
+                          if (!alive()) return
+                          Logger.log("--- Prompt ${p.num}: ${p.text.take(60)} ---")
+                          if (!processOne(flow, p)) {
+                              if (alive()) {
+                                  finishRun(me, "DETENIDO en prompt ${p.num} (fallo un paso)")
+                                  toast("Detenido en prompt ${p.num}. Mira el registro.")
+                              }
+                              return
+                          }
+                      }
+                      if (alive()) {
+                          finishRun(me, "TERMINADO flujo ${flow.name}")
+                          toast("Flujo terminado")
+                      }
+                  } catch (e: Throwable) {
+                      if (alive()) {
+                          Logger.log("ERROR: ${Log.getStackTraceString(e)}")
+                          finishRun(me, "Error")
+                      }
+                  }
+              }
+
+              private fun processOne(flow: Flow, prompt: Prompt): Boolean {
+                  for (step in flow.steps) {
+                      if (!alive()) return false
+                      Logger.log("Paso: ${step.label}")
+                      when (step.type) {
+                          "TAP" -> {
+                              if (step.x == null || step.y == null) {
+                                  Logger.log("Paso sin coordenadas: ${step.label}")
+                                  return false
+                              }
+                              if (!tap(step.x, step.y)) {
+                                  Logger.log("Fallo el toque ${step.label} en ${step.x},${step.y}")
+                                  return false
+                              }
+                              if (!pause(800)) return false
+                          }
+                          "LONG_TAP" -> {
+                              if (step.x == null || step.y == null) {
+                                  Logger.log("Paso sin coordenadas: ${step.label}")
+                                  return false
+                              }
+                              val dur = (step.durationMs ?: 1000).toLong()
+                              Logger.log("Pulsacion larga en ${step.x},${step.y} durante $dur ms")
+                              if (!gesture(step.x, step.y, step.x, step.y, dur, false)) {
+                                  Logger.log("Fallo la pulsacion larga ${step.label} en ${step.x},${step.y}")
+                                  return false
+                              }
+                              if (!pause(800)) return false
+                          }
+                          "SWIPE" -> {
+                              if (step.x == null || step.y == null || step.x2 == null || step.y2 == null) {
+                                  Logger.log("Paso sin coordenadas: ${step.label}")
+                                  return false
+                              }
+                              val dur = (step.durationMs ?: 400).toLong()
+                              Logger.log("Deslizar de ${step.x},${step.y} a ${step.x2},${step.y2} en $dur ms")
+                              if (!gesture(step.x, step.y, step.x2, step.y2, dur, true)) {
+                                  Logger.log("Fallo el deslizamiento ${step.label}")
+                                  return false
+                              }
+                              if (!pause(800)) return false
+                          }
+                          "WRITE_PROMPT" -> {
+                              var ok = false
+                              for (i in 1..3) {
+                                  if (insertText(prompt.text, flow.typingDelayMs)) { ok = true; break }
+                                  if (!alive()) return false
+                                  if (!pause(600)) return false
+                              }
+                              if (!ok) {
+                                  Logger.log("No se pudo escribir el prompt")
+                                  return false
+                              }
+                              if (!pause(600)) return false
+                          }
+                          "PAUSE" -> {
+                              val sec = step.seconds ?: 5
+                              Logger.log("Pausa ${sec}s")
+                              if (!pause(sec * 1000L)) return false
+                          }
+                          "DOWNLOAD_RENAME" -> {
+                              val folder = flow.folder
+                              val before = snapshot(folder)
+                              if (step.x != null && step.y != null) {
+                                  if (!tap(step.x, step.y)) {
+                                      Logger.log("Fallo el toque de descargar ${step.x},${step.y}")
+                                      return false
+                                  }
+                              }
+                              Logger.log("Esperando archivo nuevo en $folder")
+                              val nuevo = waitNewFile(folder, before)
+                              if (nuevo == null) {
+                                  if (!alive()) return false
+                                  Logger.log("AVISO: no aparecio archivo nuevo")
+                              } else {
+                                  renameFile(nuevo, prompt.num)
+                              }
+                              if (!pause(1200)) return false
+                          }
+                          "TAP_DYNAMIC_IMAGE" -> {
+                              val rect = findNewestImageViewNode()
+                              if (rect == null) {
+                                  Logger.log("No se encontro ninguna imagen en pantalla de forma dinamica")
+                                  return false
+                              }
+                              Logger.log("Imagen dinamica encontrada en centro: X=${rect.centerX()}, Y=${rect.centerY()}")
+                              if (!tap(rect.centerX().toFloat(), rect.centerY().toFloat())) {
+                                  Logger.log("Fallo el toque dinamico en la imagen")
+                                  return false
+                              }
+                              if (!pause(800)) return false
+                          }
+                          "LONG_TAP_DYNAMIC_IMAGE" -> {
+                              val rect = findNewestImageViewNode()
+                              if (rect == null) {
+                                  Logger.log("No se encontro imagen para pulsacion larga dinamica")
+                                  return false
+                              }
+                              val dur = (step.durationMs ?: 1000).toLong()
+                              Logger.log("Pulsacion larga dinamica en: X=${rect.centerX()}, Y=${rect.centerY()}")
+                              if (!gesture(rect.centerX().toFloat(), rect.centerY().toFloat(), rect.centerX().toFloat(), rect.centerY().toFloat(), dur, false)) {
+                                  Logger.log("Fallo la pulsacion larga dinamica")
+                                  return false
+                              }
+                              if (!pause(800)) return false
+                          }
+                      }
+                  }
+                  return true
+              }
+
+              // ---------- acciones basicas ----------
+
+              private fun tap(x: Float, y: Float): Boolean {
+                  val path = Path().apply { moveTo(x, y) }
+                  val gesture = GestureDescription.Builder()
+                      .addStroke(GestureDescription.StrokeDescription(path, 0, 60))
+                      .build()
+                  val latch = CountDownLatch(1)
+                  val ok = AtomicBoolean(false)
+                  val accepted = dispatchGesture(gesture, object : GestureResultCallback() {
+                      override fun onCompleted(g: GestureDescription?) { ok.set(true); latch.countDown() }
+                      override fun onCancelled(g: GestureDescription?) { latch.countDown() }
+                  }, main)
+                  if (!accepted) return false
+                  try {
+                      latch.await(3, TimeUnit.SECONDS)
+                  } catch (e: InterruptedException) {
+                      return false
+                  }
+                  return ok.get()
+              }
+
+              /** Pulsacion larga (swipe = false: el dedo se queda quieto) o deslizamiento (swipe = true). */
+              private fun gesture(x1: Float, y1: Float, x2: Float, y2: Float, durationMs: Long, swipe: Boolean): Boolean {
+                  val dur = durationMs.coerceIn(1L, 60000L)
+                  val path = Path().apply {
+                      moveTo(x1, y1)
+                      if (swipe) lineTo(x2, y2)
+                  }
+                  val desc = GestureDescription.Builder()
+                      .addStroke(GestureDescription.StrokeDescription(path, 0, dur))
+                      .build()
+                  val latch = CountDownLatch(1)
+                  val ok = AtomicBoolean(false)
+                  val accepted = dispatchGesture(desc, object : GestureResultCallback() {
+                      override fun onCompleted(g: GestureDescription?) { ok.set(true); latch.countDown() }
+                      override fun onCancelled(g: GestureDescription?) { latch.countDown() }
+                  }, main)
+                  if (!accepted) return false
+                  try {
+                      latch.await(dur + 3000L, TimeUnit.MILLISECONDS)
+                  } catch (e: InterruptedException) {
+                      return false
+                  }
+                  return ok.get()
+              }
+
+              // ---------- escritura de texto ----------
+
+              /** Busca el campo de texto: primero el que tiene foco, si no el primer editable. */
+              private fun findInputNode(): AccessibilityNodeInfo? {
+                  val root = rootInActiveWindow ?: return null
+                  return root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT) ?: findEditable(root)
+              }
+
+              private fun setNodeText(node: AccessibilityNodeInfo, text: String): Boolean {
+                  val args = Bundle().apply {
+                      putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, text)
+                  }
+                  return node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
+              }
+
+              /** Pausa corta de tipeo que respeta la interrupcion del hilo. */
+              private fun typingSleep(ms: Long): Boolean {
+                  return try {
+                      Thread.sleep(ms)
+                      true
+                  } catch (e: InterruptedException) {
+                      false
+                  }
+              }
+
+              /**
+               * Escribe el texto en el campo activo.
+               * delayMs > 0: simula escritura humana letra por letra (ms aproximados por letra).
+               * delayMs = 0: escribe todo el texto de golpe.
+               * Comprueba el resultado de cada accion y, si el nodo quedo obsoleto, lo busca de nuevo.
+               */
+              private fun insertText(text: String, delayMs: Int): Boolean {
+                  var node: AccessibilityNodeInfo? = findInputNode()
+                  if (node == null) {
+                      if (rootInActiveWindow == null) {
+                          Logger.log("Escribir: no hay ventana activa")
+                      } else {
+                          Logger.log("Escribir: no encontre ningun campo de texto en pantalla")
+                      }
+                      return false
+                  }
+
+                  if (delayMs <= 0) {
+                      Logger.log("Escribiendo prompt de golpe...")
+                      var ok = setNodeText(node, text)
+                      if (!ok) {
+                          val fresh = findInputNode()
+                          if (fresh != null) {
+                              node = fresh
+                              ok = setNodeText(fresh, text)
+                          }
+                      }
+                      if (!ok) {
+                          Logger.log("Escribir: el campo rechazo el texto")
+                          return false
+                      }
+                  } else {
+                      Logger.log("Escribiendo prompt simulando escritura humana (~$delayMs ms por letra)...")
+                      val d = delayMs.toLong()
+                      val jitter = d * 4 / 10
+                      val sb = StringBuilder()
+                      for (ch in text) {
+                          if (!alive()) return false
+                          sb.append(ch)
+                          var ok = setNodeText(node!!, sb.toString())
+                          var tries = 0
+                          while (!ok && tries < 3) {
+                              tries++
+                              if (!alive()) return false
+                              if (!pause(150)) return false
+                              val fresh = findInputNode()
+                              if (fresh != null) {
+                                  node = fresh
+                                  ok = setNodeText(fresh, sb.toString())
+                              }
+                          }
+                          if (!ok) {
+                              Logger.log("Escribir: fallo al escribir la letra ${sb.length} de ${text.length}")
+                              return false
+                          }
+                          val wait = if (jitter > 0) (d - jitter..d + jitter).random() else d
+                          if (!typingSleep(wait)) return false
+                      }
+                  }
+
+                  // Comprobacion final (solo aviso en el registro)
+                  try {
+                      val n = node
+                      if (n != null) {
+                          n.refresh()
+                          val cur = n.text?.toString() ?: ""
+                          val probe = text.take(20).trim()
+                          if (cur.isEmpty() || (probe.isNotEmpty() && !cur.contains(probe))) {
+                              Logger.log("AVISO: el campo no muestra el texto esperado tras escribir")
+                          }
+                      }
+                  } catch (_: Exception) {
+                  }
+                  return true
+              }
+
+              /**
+               * Busqueda universal de la imagen generada.
+               * 1) Prefiere nodos cuya clase sea una imagen (ImageView / android.widget.Image en Chrome).
+               * 2) Si no hay ninguno, usa como respaldo un nodo grande SIN hijos que no sea editable.
+               * Descarta cualquier nodo que ocupe casi toda la pantalla (contenedores / raiz) y recorta
+               * el area a la parte visible. Entre los candidatos elige el mas bajo en pantalla.
+               */
+              private fun findNewestImageViewNode(): Rect? {
+                  val root = rootInActiveWindow ?: return null
+                  val dm = resources.displayMetrics
+                  val screen = Rect(0, 0, dm.widthPixels, dm.heightPixels)
+                  val screenArea = screen.width().toLong() * screen.height().toLong()
+                  val minSide = (100 * dm.density).toInt()
+
+                  var bestImg: Rect? = null
+                  var bestImgClass = ""
+                  var bestLeaf: Rect? = null
+                  var bestLeafClass = ""
+
+                  fun better(cand: Rect, cur: Rect?): Boolean {
+                      if (cur == null) return true
+                      if (cand.bottom != cur.bottom) return cand.bottom > cur.bottom
+                      return cand.width().toLong() * cand.height() > cur.width().toLong() * cur.height()
+                  }
+
+                  val queue = java.util.ArrayDeque<AccessibilityNodeInfo>()
+                  queue.add(root)
+                  var visited = 0
+
+                  while (queue.isNotEmpty() && visited < 4000) {
+                      val n = queue.poll() ?: break
+                      visited++
+                      if (n.isVisibleToUser) {
+                          val rect = Rect()
+                          n.getBoundsInScreen(rect)
+                          if (rect.intersect(screen) && rect.width() >= minSide && rect.height() >= minSide) {
+                              val area = rect.width().toLong() * rect.height().toLong()
+                              if (area < screenArea * 85 / 100) {
+                                  val cls = n.className?.toString() ?: ""
+                                  if (cls.contains("Image", ignoreCase = true)) {
+                                      if (better(rect, bestImg)) {
+                                          bestImg = Rect(rect)
+                                          bestImgClass = cls
+                                      }
+                                  } else if (n.childCount == 0 && !n.isEditable) {
+                                      if (better(rect, bestLeaf)) {
+                                          bestLeaf = Rect(rect)
+                                          bestLeafClass = cls
+                                      }
+                                  }
+                              }
+                          }
+                      }
+                      for (i in 0 until n.childCount) {
+                          val c = n.getChild(i)
+                          if (c != null) queue.add(c)
+                      }
+                  }
+
+                  if (bestImg != null) {
+                      Logger.log("Imagen detectada por clase: $bestImgClass")
+                      return bestImg
+                  }
+                  if (bestLeaf != null) {
+                      Logger.log("AVISO: sin nodo de imagen; uso respaldo (nodo grande sin hijos): $bestLeafClass")
+                      return bestLeaf
+                  }
+                  return null
+              }
+
+              private fun findEditable(root: AccessibilityNodeInfo): AccessibilityNodeInfo? {
+                  val queue = java.util.ArrayDeque<AccessibilityNodeInfo>()
+                  queue.add(root)
+                  var firstEditable: AccessibilityNodeInfo? = null
+                  while (queue.isNotEmpty()) {
+                      val n = queue.poll() ?: break
+                      if (n.isEditable) {
+                          if (n.isFocused) return n
+                          if (firstEditable == null) firstEditable = n
+                      }
+                      for (i in 0 until n.childCount) {
+                          val c = n.getChild(i)
+                          if (c != null) queue.add(c)
+                      }
+                  }
+                  if (firstEditable != null) Logger.log("Escribir: ningun campo con foco, uso el primer campo editable")
+                  return firstEditable
+              }
+
+              private fun snapshot(folder: String): Set<String> =
+                  File(folder).listFiles()?.map { it.absolutePath }?.toSet() ?: emptySet()
+
+              private fun isTemp(name: String): Boolean {
+                  val n = name.lowercase()
+                  return n.startsWith(".") || n.endsWith(".crdownload") || n.endsWith(".tmp") ||
+                      n.endsWith(".part") || n.endsWith(".partial") || n.endsWith(".download")
+              }
+
+              private fun waitNewFile(folder: String, before: Set<String>): File? {
+                  for (i in 1..30) {
+                      if (!pause(1000)) return null
+                      val cand = File(folder).listFiles()
+                          ?.filter { it.isFile && it.absolutePath !in before && !isTemp(it.name) }
+                          ?.maxByOrNull { it.lastModified() }
+                      if (cand != null) {
+                          val size = cand.length()
+                          if (!pause(1500)) return null
+                          if (cand.exists() && cand.length() == size) return cand
+                      }
+                  }
+                  return null
+              }
+
+              private fun renameFile(f: File, num: Int) {
+                  val ext = f.extension
+                  val base = num.toString()
+                  fun name(suffix: String) = if (ext.isEmpty()) "$base$suffix" else "$base$suffix.$ext"
+                  var target = File(f.parentFile, name(""))
+                  var i = 1
+                  while (target.exists()) {
+                      target = File(f.parentFile, name("_$i"))
+                      i++
+                  }
+                  if (f.renameTo(target)) {
+                      Logger.log("Guardado como ${target.name}")
+                  } else {
+                      Logger.log("No se pudo renombrar ${f.name} a ${target.name}")
+                  }
+              }
+
+              private fun pause(ms: Long): Boolean {
+                  var left = ms
+                  try {
+                      while (left > 0 && alive()) {
+                          val s = minOf(200L, left)
+                          Thread.sleep(s)
+                          left -= s
+                      }
+                  } catch (e: InterruptedException) {
+                      return false
+                  }
+                  return alive()
+              }
+
+              private fun toast(msg: String) {
+                  main.post { Toast.makeText(applicationContext, msg, Toast.LENGTH_LONG).show() }
+              }
+
+              // ---------- panel flotante (PLAY y DETENER) ----------
+
+              private fun showPanel(flow: Flow, waitingPlay: Boolean) {
+                  main.post {
+                      removeOverlayNow()
+                      if (!running && !armed) return@post
+                      val panel = DragPanel(this).apply {
+                          orientation = LinearLayout.HORIZONTAL
+                          setBackgroundColor(0xDD202020.toInt())
+                          setPadding(8, 8, 8, 8)
+                      }
+                      if (waitingPlay) {
+                          val play = Button(this).apply {
+                              text = "▶ PLAY"
+                              textSize = 12f
+                              setTextColor(Color.WHITE)
+                              setBackgroundColor(0xFF2E7D32.toInt())
+                              setOnClickListener { beginRun(flow) }
+                          }
+                          panel.addView(play)
+                      }
+                      val stop = Button(this).apply {
+                          text = "■ DETENER"
+                          textSize = 12f
+                          setTextColor(Color.WHITE)
+                          setBackgroundColor(0xFFB00020.toInt())
+                          setOnClickListener { stopRun("Detenido por el usuario") }
+                      }
+                      val stopLp = LinearLayout.LayoutParams(
+                          LinearLayout.LayoutParams.WRAP_CONTENT,
+                          LinearLayout.LayoutParams.WRAP_CONTENT
+                      )
+                      if (waitingPlay) stopLp.leftMargin = 12
+                      panel.addView(stop, stopLp)
+
+                      val lp = WindowManager.LayoutParams(
+                          WindowManager.LayoutParams.WRAP_CONTENT,
+                          WindowManager.LayoutParams.WRAP_CONTENT,
+                          WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+                          WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON,
+                          PixelFormat.TRANSLUCENT
+                      ).apply { gravity = Gravity.TOP or Gravity.END; x = panelX; y = panelY }
+                      try {
+                          val wm = getSystemService(WINDOW_SERVICE) as WindowManager
+                          panel.wm = wm
+                          panel.lp = lp
+                          panel.onMoved = { nx, ny -> panelX = nx; panelY = ny }
+                          wm.addView(panel, lp)
+                          overlay = panel
+                      } catch (e: Exception) {
+                          Logger.log("No se pudo mostrar el panel flotante: ${e.message}")
+                      }
+                  }
+              }
+
+              /** Quita el panel de inmediato (solo llamar desde el hilo principal). */
+              private fun removeOverlayNow() {
+                  val v = overlay
+                  if (v != null) {
+                      try { (getSystemService(WINDOW_SERVICE) as WindowManager).removeView(v) } catch (_: Exception) {}
+                  }
+                  overlay = null
+              }
+
+              private fun hideOverlay() {
+                  main.post { removeOverlayNow() }
+              }
+          }
+
+          /**
+           * Panel flotante arrastrable. Un toque normal llega a los botones (PLAY / DETENER);
+           * si el dedo se desliza mas alla del umbral, el panel completo se mueve con el dedo.
+           * La ventana usa gravity TOP|END, asi que x se mide desde el borde derecho.
+           */
+          class DragPanel(context: android.content.Context) : LinearLayout(context) {
+              var wm: WindowManager? = null
+              var lp: WindowManager.LayoutParams? = null
+              var onMoved: ((Int, Int) -> Unit)? = null
+
+              private val slop = ViewConfiguration.get(context).scaledTouchSlop
+              private var startRawX = 0f
+              private var startRawY = 0f
+              private var startX = 0
+              private var startY = 0
+              private var dragging = false
+
+              private fun begin(ev: MotionEvent) {
+                  startRawX = ev.rawX
+                  startRawY = ev.rawY
+                  startX = lp?.x ?: 0
+                  startY = lp?.y ?: 0
+                  dragging = false
+              }
+
+              private fun movedPastSlop(ev: MotionEvent): Boolean {
+                  return Math.abs(ev.rawX - startRawX) > slop || Math.abs(ev.rawY - startRawY) > slop
+              }
+
+              private fun moveTo(ev: MotionEvent) {
+                  val params = lp ?: return
+                  val manager = wm ?: return
+                  val dm = resources.displayMetrics
+                  val maxX = (dm.widthPixels - width).coerceAtLeast(0)
+                  val maxY = (dm.heightPixels - height).coerceAtLeast(0)
+                  val nx = (startX - (ev.rawX - startRawX)).toInt().coerceIn(0, maxX)
+                  val ny = (startY + (ev.rawY - startRawY)).toInt().coerceIn(0, maxY)
+                  params.x = nx
+                  params.y = ny
+                  try {
+                      manager.updateViewLayout(this, params)
+                      onMoved?.invoke(nx, ny)
+                  } catch (_: Exception) {
+                  }
+              }
+
+              override fun onInterceptTouchEvent(ev: MotionEvent): Boolean {
+                  when (ev.actionMasked) {
+                      MotionEvent.ACTION_DOWN -> begin(ev)
+                      MotionEvent.ACTION_MOVE -> {
+                          if (!dragging && movedPastSlop(ev)) {
+                              dragging = true
+                              return true
+                          }
+                      }
+                      MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> dragging = false
+                  }
+                  return dragging
+              }
+
+              override fun onTouchEvent(ev: MotionEvent): Boolean {
+                  when (ev.actionMasked) {
+                      MotionEvent.ACTION_DOWN -> begin(ev)
+                      MotionEvent.ACTION_MOVE -> {
+                          if (!dragging && movedPastSlop(ev)) dragging = true
+                          if (dragging) moveTo(ev)
+                      }
+                      MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> dragging = false
+                  }
+                  return true
+              }
+          }
+          FIN_ARCHIVO_2
+          mkdir -p "$(dirname 'app/src/main/java/com/autoprompter/Logger.kt')"
+          cat > 'app/src/main/java/com/autoprompter/Logger.kt' <<'FIN_ARCHIVO_3'
+          package com.autoprompter
+
+          import android.content.Context
+          import java.io.File
+          import java.text.SimpleDateFormat
+          import java.util.Date
+          import java.util.Locale
+
+          object Logger {
+              private lateinit var file: File
+
+              fun init(ctx: Context) {
+                  if (!::file.isInitialized) {
+                      file = File(ctx.applicationContext.filesDir, "registro.txt")
+                  }
+              }
+
+              @Synchronized
+              fun log(msg: String) {
+                  if (!::file.isInitialized) return
+                  try {
+                      val t = SimpleDateFormat("dd/MM HH:mm:ss", Locale.US).format(Date())
+                      file.appendText("$t  $msg\n")
+                      if (file.length() > 300_000) {
+                          file.writeText(file.readText().takeLast(100_000))
+                      }
+                  } catch (_: Exception) {
+                  }
+              }
+
+              @Synchronized
+              fun read(): String {
+                  if (!::file.isInitialized) return ""
+                  return try { if (file.exists()) file.readText() else "" } catch (_: Exception) { "" }
+              }
+
+              @Synchronized
+              fun clear() {
+                  if (!::file.isInitialized) return
+                  try { file.writeText("") } catch (_: Exception) {}
+              }
+          }
+          FIN_ARCHIVO_3
+          mkdir -p "$(dirname 'app/src/main/java/com/autoprompter/MainActivity.kt')"
+          cat > 'app/src/main/java/com/autoprompter/MainActivity.kt' <<'FIN_ARCHIVO_4'
+          package com.autoprompter
+
+          import android.Manifest
+          import android.content.ClipData
+          import android.content.ClipboardManager
+          import android.content.DialogInterface
+          import android.content.Intent
+          import android.content.SharedPreferences
+          import android.content.pm.PackageManager
+          import android.graphics.Color
+          import android.graphics.drawable.GradientDrawable
+          import android.net.Uri
+          import android.os.Build
+          import android.os.Bundle
+          import android.os.Environment
+          import android.provider.Settings
+          import android.text.InputType
+          import android.util.Log
+          import android.view.Gravity
+          import android.view.View
+          import android.widget.CheckBox
+          import android.widget.EditText
+          import android.widget.LinearLayout
+          import android.widget.ScrollView
+          import android.widget.TextView
+          import android.widget.Toast
+          import androidx.activity.OnBackPressedCallback
+          import androidx.appcompat.app.AppCompatActivity
+          import com.google.android.material.button.MaterialButton
+          import com.google.android.material.card.MaterialCardView
+          import com.google.android.material.dialog.MaterialAlertDialogBuilder
+          import com.google.gson.Gson
+          import com.google.gson.reflect.TypeToken
+          import java.io.File
+
+          class MainActivity : AppCompatActivity() {
+
+              private lateinit var prefs: SharedPreferences
+              private val gson = Gson()
+              private var flows: MutableList<Flow> = mutableListOf()
+              private var currentFlowId: String? = null
+
+              private lateinit var rootContainer: LinearLayout
+
+              // Aplica los campos de configuracion editados en la pantalla de detalle al flujo abierto.
+              private var applyCfg: () -> Unit = {}
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  Logger.init(this)
+                  val old = Thread.getDefaultUncaughtExceptionHandler()
+                  Thread.setDefaultUncaughtExceptionHandler { t, e ->
+                      Logger.log("CRASH: ${Log.getStackTraceString(e)}")
+                      old?.uncaughtException(t, e)
+                  }
+                  prefs = getSharedPreferences("flows_v2", MODE_PRIVATE)
+                  loadFlows()
+                  buildUi()
+
+                  // Boton Atras: dentro de un flujo vuelve a la lista (guardando); en la lista sale de la app.
+                  onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
+                      override fun handleOnBackPressed() {
+                          if (currentFlowId != null) {
+                              applyCfg()
+                              saveFlows()
+                              currentFlowId = null
+                              buildUi()
+                          } else {
+                              isEnabled = false
+                              onBackPressedDispatcher.onBackPressed()
+                          }
+                      }
+                  })
+              }
+
+              override fun onResume() {
+                  super.onResume()
+                  if (::rootContainer.isInitialized && currentFlowId == null) buildFlowList()
+              }
+
+              override fun onPause() {
+                  super.onPause()
+                  // Guarda tambien lo que se haya escrito en los campos de configuracion.
+                  if (currentFlowId != null) {
+                      try { applyCfg() } catch (_: Exception) {}
+                  }
+                  saveFlows()
+              }
+
+              // ---------- persistencia ----------
+
+              private fun saveFlows() {
+                  try {
+                      prefs.edit().putString("flows_json", gson.toJson(flows)).apply()
+                  } catch (_: Exception) {}
+              }
+
+              private fun loadFlows() {
+                  try {
+                      val json = prefs.getString("flows_json", null)
+                      if (json != null) {
+                          val type = object : TypeToken<MutableList<Flow>>() {}.type
+                          flows = gson.fromJson(json, type) ?: mutableListOf()
+                      }
+                  } catch (e: Exception) {
+                      flows = mutableListOf()
+                  }
+                  if (flows.isEmpty()) {
+                      val oldPrefs = getSharedPreferences("cfg", MODE_PRIVATE)
+                      val oldPrompts = oldPrefs.getString("prompts", "")
+                      if (!oldPrompts.isNullOrEmpty()) {
+                          val f = Flow(name = "Mi primer flujo", promptsRaw = oldPrompts)
+                          f.folder = oldPrefs.getString("folder", Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS).absolutePath) ?: "/storage/emulated/0/Download"
+                          val tx = oldPrefs.getString("tx", "")?.toFloatOrNull()
+                          val ty = oldPrefs.getString("ty", "")?.toFloatOrNull()
+                          val sx = oldPrefs.getString("sx", "")?.toFloatOrNull()
+                          val sy = oldPrefs.getString("sy", "")?.toFloatOrNull()
+                          val dx = oldPrefs.getString("dx", "")?.toFloatOrNull()
+                          val dy = oldPrefs.getString("dy", "")?.toFloatOrNull()
+                          val wait = oldPrefs.getString("wait", "60")?.toIntOrNull() ?: 60
+                          if (tx != null && ty != null) f.steps.add(Step(type = "TAP", label = "Tocar Textarea", x = tx, y = ty))
+                          f.steps.add(Step(type = "WRITE_PROMPT", label = "Escribir Prompt"))
+                          if (sx != null && sy != null) f.steps.add(Step(type = "TAP", label = "Tocar Enviar", x = sx, y = sy))
+                          f.steps.add(Step(type = "PAUSE", label = "Esperar generacion", seconds = wait))
+                          if (dx != null && dy != null) f.steps.add(Step(type = "DOWNLOAD_RENAME", label = "Descargar y Renombrar", x = dx, y = dy))
+                          flows.add(f)
+                          saveFlows()
+                      }
+                  }
+              }
+
+              // ---------- helpers UI ----------
+
+              private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+
+              private fun bgRounded(color: Int, radius: Int = 16): GradientDrawable {
+                  return GradientDrawable().apply {
+                      setColor(color)
+                      cornerRadius = dp(radius).toFloat()
+                  }
+              }
+
+              private fun card(): MaterialCardView {
+                  return MaterialCardView(this).apply {
+                      radius = dp(16).toFloat()
+                      cardElevation = dp(2).toFloat()
+                      setCardBackgroundColor(Color.parseColor("#1E1E1E"))
+                      strokeWidth = 0
+                      val p = dp(12)
+                      setContentPadding(p, p, p, p)
+                      layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
+                          setMargins(0, 0, 0, dp(12))
+                      }
+                  }
+              }
+
+              private fun label(text: String, size: Float = 13f, color: Int = Color.parseColor("#AAAAAA")): TextView {
+                  return TextView(this).apply {
+                      this.text = text
+                      textSize = size
+                      setTextColor(color)
+                      setPadding(0, dp(6), 0, dp(4))
+                  }
+              }
+
+              private fun title(text: String): TextView {
+                  return TextView(this).apply {
+                      this.text = text
+                      textSize = 16f
+                      setTextColor(Color.WHITE)
+                      setTypeface(null, android.graphics.Typeface.BOLD)
+                  }
+              }
+
+              private fun edit(hint: String, text: String = "", multi: Boolean = false, numeric: Boolean = false): EditText {
+                  return EditText(this).apply {
+                      this.hint = hint
+                      setText(text)
+                      setHintTextColor(Color.parseColor("#666666"))
+                      setTextColor(Color.WHITE)
+                      background = bgRounded(Color.parseColor("#2A2A2A"), 10)
+                      setPadding(dp(14), dp(12), dp(14), dp(12))
+                      if (numeric) inputType = InputType.TYPE_CLASS_NUMBER
+                      else if (multi) {
+                          inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE
+                          minLines = 6
+                          gravity = Gravity.TOP
+                      } else {
+                          inputType = InputType.TYPE_CLASS_TEXT
+                      }
+                  }
+              }
+
+              private fun mButton(text: String, bgColor: Int = Color.parseColor("#2A2A2A"), icon: String = ""): MaterialButton {
+                  return MaterialButton(this).apply {
+                      this.text = if (icon.isNotEmpty()) "$icon $text" else text
+                      setBackgroundColor(bgColor)
+                      setTextColor(Color.WHITE)
+                      cornerRadius = dp(12)
+                      setPadding(dp(16), dp(12), dp(16), dp(12))
+                  }
+              }
+
+              // ---------- UI principal ----------
+
+              private fun buildUi() {
+                  rootContainer = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setBackgroundColor(Color.parseColor("#121212"))
+                  }
+                  val scroll = ScrollView(this).apply {
+                      setBackgroundColor(Color.parseColor("#121212"))
+                      addView(rootContainer)
+                  }
+                  setContentView(scroll)
+
+                  if (currentFlowId == null) {
+                      buildFlowList()
+                  } else {
+                      val flow = flows.find { it.id == currentFlowId }
+                      if (flow != null) buildFlowDetail(flow) else {
+                          currentFlowId = null
+                          buildFlowList()
+                      }
+                  }
+              }
+
+              private fun buildFlowList() {
+                  applyCfg = {}
+                  rootContainer.removeAllViews()
+                  rootContainer.setPadding(dp(16), dp(16), dp(16), dp(32))
+
+                  val header = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+                  header.addView(TextView(this).apply {
+                      text = "AutoPrompter 2.3"
+                      textSize = 24f
+                      setTextColor(Color.WHITE)
+                      setTypeface(null, android.graphics.Typeface.BOLD)
+                  })
+                  header.addView(label("Flujos de automatizacion - toca un flujo para editarlo", 12f))
+                  rootContainer.addView(header)
+                  rootContainer.addView(View(this).apply { layoutParams = LinearLayout.LayoutParams(-1, dp(16)) })
+
+                  val permCard = card()
+                  val permLay = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+                  permLay.addView(title("Estado"))
+                  val hasStorage = hasStorage()
+                  val hasAcc = ClickService.instance != null
+                  permLay.addView(label("Archivos: ${if (hasStorage) "✅ OK" else "❌ Falta"} | Accesibilidad: ${if (hasAcc) "✅ OK" else "❌ Falta"}", 12f, if (hasStorage && hasAcc) Color.parseColor("#81C784") else Color.parseColor("#EF9A9A")))
+                  val rowPerm = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+                  rowPerm.addView(mButton("Archivos", Color.parseColor("#333333")).apply {
+                      layoutParams = LinearLayout.LayoutParams(0, -2, 1f).apply { marginEnd = dp(8) }
+                      setOnClickListener { askStorage() }
+                  })
+                  rowPerm.addView(mButton("Accesibilidad", Color.parseColor("#333333")).apply {
+                      layoutParams = LinearLayout.LayoutParams(0, -2, 1f)
+                      setOnClickListener { askAccessibility() }
+                  })
+                  permLay.addView(rowPerm)
+                  permLay.addView(mButton("Ver registro", Color.parseColor("#2A2A2A")).apply {
+                      setOnClickListener { showLog() }
+                  })
+                  val rowCtl = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+                  rowCtl.addView(mButton("Detener flujo", Color.parseColor("#7F0000")).apply {
+                      layoutParams = LinearLayout.LayoutParams(0, -2, 1f).apply { marginEnd = dp(8) }
+                      setOnClickListener {
+                          val svc = ClickService.instance
+                          if (svc != null) {
+                              svc.stopRun("Detenido desde la app")
+                              toast("Flujo detenido")
+                          } else {
+                              toast("El servicio de accesibilidad no esta activo")
+                          }
+                      }
+                  })
+                  rowCtl.addView(mButton("Cerrar aplicacion", Color.parseColor("#333333")).apply {
+                      layoutParams = LinearLayout.LayoutParams(0, -2, 1f)
+                      setOnClickListener {
+                          ClickService.instance?.stopRun("Aplicacion cerrada por el usuario")
+                          saveFlows()
+                          finishAndRemoveTask()
+                      }
+                  })
+                  permLay.addView(rowCtl)
+                  permCard.addView(permLay)
+                  rootContainer.addView(permCard)
+
+                  val createBtn = mButton("＋ CREAR NUEVO FLUJO", Color.parseColor("#1B5E20")).apply {
+                      setOnClickListener { showCreateFlowDialog() }
+                  }
+                  rootContainer.addView(createBtn)
+
+                  if (flows.isEmpty()) {
+                      rootContainer.addView(label("No tienes flujos. Crea uno para empezar.", 13f, Color.parseColor("#777777")).apply {
+                          gravity = Gravity.CENTER
+                          setPadding(0, dp(24), 0, dp(24))
+                      })
+                  }
+
+                  for (flow in flows) {
+                      val c = card()
+                      val lay = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+
+                      val topRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
+                      val nameTv = TextView(this).apply {
+                          text = flow.name
+                          textSize = 16f
+                          setTextColor(Color.WHITE)
+                          setTypeface(null, android.graphics.Typeface.BOLD)
+                          layoutParams = LinearLayout.LayoutParams(0, -2, 1f)
+                      }
+                      topRow.addView(nameTv)
+
+                      val moreBtn = TextView(this).apply {
+                          text = "⋮"
+                          textSize = 20f
+                          setTextColor(Color.WHITE)
+                          setPadding(dp(12), dp(4), dp(12), dp(4))
+                          setOnClickListener { showFlowMenu(flow) }
+                      }
+                      topRow.addView(moreBtn)
+                      lay.addView(topRow)
+
+                      lay.addView(label("${flow.steps.size} pasos • Carpeta: ${File(flow.folder).name} • Espera: ${flow.waitBeforeStart}s • ${if (flow.useFloatingButton) "Flotante" else "Auto"}", 11f))
+
+                      val count = parsePromptList(flow.promptList()).size
+                      if (count > 0) {
+                          lay.addView(label("$count prompts", 11f, Color.parseColor("#90CAF9")))
+                      }
+
+                      val btnRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+                      btnRow.addView(mButton("Abrir", Color.parseColor("#333333")).apply {
+                          layoutParams = LinearLayout.LayoutParams(0, -2, 1f).apply { marginEnd = dp(8) }
+                          setOnClickListener {
+                              currentFlowId = flow.id
+                              buildUi()
+                          }
+                      })
+                      btnRow.addView(mButton("▶ Ejecutar", Color.parseColor("#2E7D32")).apply {
+                          layoutParams = LinearLayout.LayoutParams(0, -2, 1f)
+                          setOnClickListener { executeFlow(flow) }
+                      })
+                      lay.addView(btnRow)
+
+                      c.addView(lay)
+                      c.setOnClickListener {
+                          currentFlowId = flow.id
+                          buildUi()
+                      }
+                      rootContainer.addView(c)
+                  }
+              }
+
+              private fun buildFlowDetail(flow: Flow) {
+                  // Si ya habia una pantalla de detalle con campos editados, se guardan antes de reconstruir.
+                  try { applyCfg() } catch (_: Exception) {}
+                  applyCfg = {}
+
+                  rootContainer.removeAllViews()
+                  rootContainer.setPadding(dp(16), dp(16), dp(16), dp(32))
+
+                  val top = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
+                  top.addView(mButton("← Volver", Color.parseColor("#333333")).apply {
+                      setOnClickListener {
+                          applyCfg()
+                          saveFlows()
+                          currentFlowId = null
+                          buildUi()
+                      }
+                  })
+                  top.addView(View(this).apply { layoutParams = LinearLayout.LayoutParams(0, 0, 1f) })
+                  top.addView(mButton("Ejecutar", Color.parseColor("#2E7D32")).apply {
+                      setOnClickListener {
+                          applyCfg()
+                          executeFlow(flow)
+                      }
+                  })
+                  rootContainer.addView(top)
+
+                  rootContainer.addView(title(flow.name).apply { textSize = 22f; setPadding(0, dp(16), 0, dp(8)) })
+
+                  val cfgCard = card()
+                  val cfgLay = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+                  cfgLay.addView(title("Configuracion"))
+                  cfgLay.addView(label("Nombre del flujo"))
+                  val etName = edit("Nombre", flow.name)
+                  cfgLay.addView(etName)
+
+                  cfgLay.addView(label("Carpeta de descargas"))
+                  val etFolder = edit("Carpeta", flow.folder)
+                  cfgLay.addView(etFolder)
+
+                  cfgLay.addView(label("Espera inicial (s): segundos que espera antes de empezar a escribir el prompt."))
+                  val etWaitStart = edit("15", flow.waitBeforeStart.toString(), numeric = true)
+                  cfgLay.addView(etWaitStart)
+
+                  cfgLay.addView(label("Velocidad de escritura (ms por letra). 0 = escribir todo de golpe."))
+                  val etTyping = edit("50", flow.typingDelayMs.toString(), numeric = true)
+                  cfgLay.addView(etTyping)
+
+                  val cbFloat = CheckBox(this).apply {
+                      text = "Usar boton flotante PLAY (recomendado)"
+                      isChecked = flow.useFloatingButton
+                      setTextColor(Color.WHITE)
+                  }
+                  cfgLay.addView(cbFloat)
+
+                  applyCfg = {
+                      flow.name = etName.text.toString().ifBlank { flow.name }
+                      flow.folder = etFolder.text.toString().ifBlank { flow.folder }
+                      flow.waitBeforeStart = etWaitStart.text.toString().toIntOrNull() ?: 15
+                      flow.typingDelayMs = etTyping.text.toString().toIntOrNull()?.coerceIn(0, 1000) ?: 50
+                      flow.useFloatingButton = cbFloat.isChecked
+                  }
+
+                  cfgLay.addView(mButton("Guardar config", Color.parseColor("#37474F")).apply {
+                      setOnClickListener {
+                          applyCfg()
+                          saveFlows()
+                          toast("Guardado")
+                          buildUi()
+                      }
+                  })
+
+                  cfgCard.addView(cfgLay)
+                  rootContainer.addView(cfgCard)
+
+                  val stepsCard = card()
+                  val stepsLay = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+                  stepsLay.addView(title("Pasos del flujo (${flow.steps.size})"))
+                  stepsLay.addView(label("Toca ⋮ en cada paso para editar o borrar", 11f))
+
+                  if (flow.steps.isEmpty()) {
+                      stepsLay.addView(label("Sin pasos. Agrega con los botones de abajo.", 12f, Color.parseColor("#777777")))
+                  }
+
+                  for ((index, step) in flow.steps.withIndex()) {
+                      val itemCard = MaterialCardView(this).apply {
+                          radius = dp(10).toFloat()
+                          cardElevation = 0f
+                          setCardBackgroundColor(Color.parseColor("#2A2A2A"))
+                          layoutParams = LinearLayout.LayoutParams(-1, -2).apply { setMargins(0, 0, 0, dp(8)) }
+                          setContentPadding(dp(10), dp(10), dp(10), dp(10))
+                      }
+                      val itemLay = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
+
+                      val icon = TextView(this).apply {
+                          text = when (step.type) {
+                              "TAP" -> "👆"
+                              "LONG_TAP" -> "👇"
+                              "SWIPE" -> "👉"
+                              "WRITE_PROMPT" -> "✍️"
+                              "PAUSE" -> "⏱️"
+                              "DOWNLOAD_RENAME" -> "💾"
+                              "TAP_DYNAMIC_IMAGE" -> "🔍"
+                              "LONG_TAP_DYNAMIC_IMAGE" -> "👇"
+                              else -> "•"
+                          }
+                          textSize = 16f
+                          setPadding(0, 0, dp(8), 0)
+                      }
+                      itemLay.addView(icon)
+
+                      val infoLay = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; layoutParams = LinearLayout.LayoutParams(0, -2, 1f) }
+                      infoLay.addView(TextView(this).apply {
+                          text = "${index + 1}. ${step.label}"
+                          textSize = 13f
+                          setTextColor(Color.WHITE)
+                          setTypeface(null, android.graphics.Typeface.BOLD)
+                      })
+                      val detail = when (step.type) {
+                          "TAP" -> "X:${step.x} Y:${step.y}"
+                          "LONG_TAP" -> "X:${step.x} Y:${step.y} • ${step.durationMs ?: 1000} ms"
+                          "SWIPE" -> "De X:${step.x} Y:${step.y} a X:${step.x2} Y:${step.y2} • ${step.durationMs ?: 400} ms"
+                          "PAUSE" -> "${step.seconds}s"
+                          "DOWNLOAD_RENAME" -> "Descarga X:${step.x} Y:${step.y}"
+                          "TAP_DYNAMIC_IMAGE", "LONG_TAP_DYNAMIC_IMAGE" -> "Busqueda automatica de la imagen mas baja en pantalla"
+                          "WRITE_PROMPT" -> {
+                              val src = step.text?.takeIf { it.isNotBlank() } ?: flow.promptsRaw
+                              "${parsePromptList(src).size} prompts (⋮ → Editar para cambiar la lista)"
+                          }
+                          else -> ""
+                      }
+                      infoLay.addView(label(detail, 11f))
+                      itemLay.addView(infoLay)
+
+                      val more = TextView(this).apply {
+                          text = "⋮"
+                          textSize = 18f
+                          setTextColor(Color.WHITE)
+                          setPadding(dp(12), dp(4), dp(12), dp(4))
+                          setOnClickListener { showStepMenu(flow, step) }
+                      }
+                      itemLay.addView(more)
+
+                      itemCard.addView(itemLay)
+                      stepsLay.addView(itemCard)
+                  }
+
+                  stepsCard.addView(stepsLay)
+                  rootContainer.addView(stepsCard)
+
+                  val addCard = card()
+                  val addLay = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+                  addLay.addView(title("Agregar pasos"))
+                  addLay.addView(label("Botones rapidos: usalos en el orden que necesites", 11f))
+
+                  val grid = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+
+                  val rowA = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+                  rowA.addView(mButton("+ Textarea", Color.parseColor("#4E342E")).apply {
+                      layoutParams = LinearLayout.LayoutParams(0, -2, 1f).apply { marginEnd = dp(6) }
+                      setOnClickListener { showAddTapDialog(flow, "Tocar Textarea") }
+                  })
+                  rowA.addView(mButton("+ Prompt", Color.parseColor("#1A237E")).apply {
+                      layoutParams = LinearLayout.LayoutParams(0, -2, 1f).apply { marginStart = dp(6) }
+                      setOnClickListener { showPromptDialog(flow) }
+                  })
+                  grid.addView(rowA)
+
+                  val rowB = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+                  rowB.addView(mButton("+ Enviar", Color.parseColor("#3E2723")).apply {
+                      layoutParams = LinearLayout.LayoutParams(0, -2, 1f).apply { marginEnd = dp(6) }
+                      setOnClickListener { showAddTapDialog(flow, "Tocar Enviar") }
+                  })
+                  rowB.addView(mButton("+ Espera", Color.parseColor("#004D40")).apply {
+                      layoutParams = LinearLayout.LayoutParams(0, -2, 1f).apply { marginStart = dp(6) }
+                      setOnClickListener { showAddPauseDialog(flow) }
+                  })
+                  grid.addView(rowB)
+
+                  val rowC = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+                  rowC.addView(mButton("+ Click", Color.parseColor("#4A148C")).apply {
+                      layoutParams = LinearLayout.LayoutParams(-1, -2, 1f)
+                      setOnClickListener { showAddTapDialog(flow, "Click") }
+                  })
+                  grid.addView(rowC)
+
+                  val rowE = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+                  rowE.addView(mButton("+ Pulsación larga", Color.parseColor("#880E4F")).apply {
+                      layoutParams = LinearLayout.LayoutParams(0, -2, 1f).apply { marginEnd = dp(6) }
+                      setOnClickListener { showAddLongTapDialog(flow) }
+                  })
+                  rowE.addView(mButton("+ Deslizar", Color.parseColor("#E65100")).apply {
+                      layoutParams = LinearLayout.LayoutParams(0, -2, 1f).apply { marginStart = dp(6) }
+                      setOnClickListener { showAddSwipeDialog(flow) }
+                  })
+                  grid.addView(rowE)
+
+                  val rowD = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+                  rowD.addView(mButton("+ Descarga y Renombrar", Color.parseColor("#0D47A1")).apply {
+                      layoutParams = LinearLayout.LayoutParams(-1, -2, 1f)
+                      setOnClickListener { showAddDownloadDialog(flow) }
+                  })
+                  grid.addView(rowD)
+
+                  // Botones dinamicos para IAs impredecibles
+                  val rowDyn = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+                  rowDyn.addView(mButton("+ Tocar imagen dinámica", Color.parseColor("#00695C")).apply {
+                      layoutParams = LinearLayout.LayoutParams(0, -2, 1f).apply { marginEnd = dp(6) }
+                      setOnClickListener {
+                          flow.steps.add(Step(type = "TAP_DYNAMIC_IMAGE", label = "Tocar última imagen (Dinámica)"))
+                          saveFlows()
+                          buildUi()
+                      }
+                  })
+                  rowDyn.addView(mButton("+ Pulsación larga imagen", Color.parseColor("#AD1457")).apply {
+                      layoutParams = LinearLayout.LayoutParams(0, -2, 1f).apply { marginStart = dp(6) }
+                      setOnClickListener {
+                          flow.steps.add(Step(type = "LONG_TAP_DYNAMIC_IMAGE", label = "Pulsación larga en imagen (Dinámica)", durationMs = 1000))
+                          saveFlows()
+                          buildUi()
+                      }
+                  })
+                  grid.addView(rowDyn)
+
+                  addLay.addView(grid)
+                  addCard.addView(addLay)
+                  rootContainer.addView(addCard)
+              }
+
+              // ---------- dialogs ----------
+
+              private fun showCreateFlowDialog() {
+                  val et = edit("Nombre del flujo", "Gemini")
+                  MaterialAlertDialogBuilder(this)
+                      .setTitle("Nuevo flujo")
+                      .setView(et.apply { setPadding(dp(16), dp(8), dp(16), dp(8)) })
+                      .setPositiveButton("Crear") { _, _ ->
+                          val name = et.text.toString().ifBlank { "Flujo ${flows.size + 1}" }
+                          val flow = Flow(name = name)
+                          flows.add(flow)
+                          saveFlows()
+                          currentFlowId = flow.id
+                          buildUi()
+                      }
+                      .setNegativeButton("Cancelar", null)
+                      .show()
+              }
+
+              private fun showFlowMenu(flow: Flow) {
+                  val options = arrayOf("Renombrar", "Duplicar", "Borrar")
+                  MaterialAlertDialogBuilder(this)
+                      .setTitle(flow.name)
+                      .setItems(options) { _, which ->
+                          when (which) {
+                              0 -> {
+                                  val et = edit("Nombre", flow.name)
+                                  MaterialAlertDialogBuilder(this).setTitle("Renombrar").setView(et).setPositiveButton("Guardar") { _, _ ->
+                                      flow.name = et.text.toString().ifBlank { flow.name }
+                                      saveFlows()
+                                      buildUi()
+                                  }.setNegativeButton("Cancelar", null).show()
+                              }
+                              1 -> {
+                                  val copy = flow.copy(id = java.util.UUID.randomUUID().toString(), name = flow.name + " copia", steps = flow.steps.map { it.copy(id = java.util.UUID.randomUUID().toString()) }.toMutableList())
+                                  flows.add(copy)
+                                  saveFlows()
+                                  buildUi()
+                              }
+                              2 -> {
+                                  MaterialAlertDialogBuilder(this).setTitle("Borrar ${flow.name}?").setPositiveButton("Borrar") { _, _ ->
+                                      flows.remove(flow)
+                                      saveFlows()
+                                      buildUi()
+                                  }.setNegativeButton("Cancelar", null).show()
+                              }
+                          }
+                      }.show()
+              }
+
+              private fun showStepMenu(flow: Flow, step: Step) {
+                  val options = arrayOf("Editar", "Borrar", "Mover arriba", "Mover abajo")
+                  MaterialAlertDialogBuilder(this)
+                      .setTitle(step.label)
+                      .setItems(options) { _, which ->
+                          when (which) {
+                              0 -> showEditStepDialog(flow, step)
+                              1 -> {
+                                  flow.steps.remove(step)
+                                  saveFlows()
+                                  buildUi()
+                              }
+                              2 -> {
+                                  val idx = flow.steps.indexOf(step)
+                                  if (idx > 0) {
+                                      flow.steps.removeAt(idx)
+                                      flow.steps.add(idx - 1, step)
+                                      saveFlows()
+                                      buildUi()
+                                  }
+                              }
+                              3 -> {
+                                  val idx = flow.steps.indexOf(step)
+                                  if (idx >= 0 && idx < flow.steps.size - 1) {
+                                      flow.steps.removeAt(idx)
+                                      flow.steps.add(idx + 1, step)
+                                      saveFlows()
+                                      buildUi()
+                                  }
+                              }
+                          }
+                      }.show()
+              }
+
+              private fun showPromptDialog(flow: Flow) {
+                  val existing = flow.steps.firstOrNull { it.type == "WRITE_PROMPT" }
+                  val current = existing?.text?.takeIf { it.isNotBlank() } ?: flow.promptsRaw
+                  val et = edit("1. generame imagen de un gato", current, multi = true)
+                  et.minLines = 8
+                  val lay = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(dp(16), dp(8), dp(16), dp(8))
+                  }
+                  lay.addView(label("Formato: numero, punto y el prompt (1. texto). El numero sera el nombre de la imagen descargada.", 12f))
+                  lay.addView(et)
+                  val sv = ScrollView(this).apply { addView(lay) }
+                  val dialog = MaterialAlertDialogBuilder(this)
+                      .setTitle("Lista de prompts")
+                      .setView(sv)
+                      .setPositiveButton("Guardar", null)
+                      .setNegativeButton("Cancelar", null)
+                      .show()
+                  dialog.getButton(DialogInterface.BUTTON_POSITIVE).setOnClickListener {
+                      val txt = et.text.toString()
+                      val n = parsePromptList(txt).size
+                      if (n == 0) {
+                          toast("Formato invalido. Usa: 1. texto")
+                          return@setOnClickListener
+                      }
+                      if (existing != null) {
+                          val idx = flow.steps.indexOf(existing)
+                          if (idx >= 0) flow.steps[idx] = existing.copy(text = txt)
+                      } else {
+                          flow.steps.add(Step(type = "WRITE_PROMPT", label = "Escribir Prompt", text = txt))
+                      }
+                      flow.promptsRaw = ""
+                      saveFlows()
+                      toast("Prompts guardados: $n")
+                      dialog.dismiss()
+                      buildUi()
+                  }
+              }
+
+              private fun showAddTapDialog(flow: Flow, defaultLabel: String) {
+                  val lay = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(16), dp(8), dp(16), dp(8)) }
+                  val etLabel = edit("Etiqueta", defaultLabel)
+                  val etX = edit("X", "", numeric = true)
+                  val etY = edit("Y", "", numeric = true)
+                  lay.addView(label("Etiqueta")); lay.addView(etLabel)
+                  lay.addView(label("Coordenada X")); lay.addView(etX)
+                  lay.addView(label("Coordenada Y")); lay.addView(etY)
+                  MaterialAlertDialogBuilder(this).setTitle(defaultLabel).setView(lay).setPositiveButton("Agregar") { _, _ ->
+                      val x = etX.text.toString().toFloatOrNull()
+                      val y = etY.text.toString().toFloatOrNull()
+                      if (x == null || y == null) { toast("Faltan coordenadas"); return@setPositiveButton }
+                      flow.steps.add(Step(type = "TAP", label = etLabel.text.toString().ifBlank { defaultLabel }, x = x, y = y))
+                      saveFlows()
+                      buildUi()
+                  }.setNegativeButton("Cancelar", null).show()
+              }
+
+              private fun showAddLongTapDialog(flow: Flow) {
+                  val lay = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(16), dp(8), dp(16), dp(8)) }
+                  val etLabel = edit("Etiqueta", "Pulsacion larga")
+                  val etX = edit("X", "", numeric = true)
+                  val etY = edit("Y", "", numeric = true)
+                  val etMs = edit("Milisegundos", "1000", numeric = true)
+                  lay.addView(label("Etiqueta")); lay.addView(etLabel)
+                  lay.addView(label("Coordenada X")); lay.addView(etX)
+                  lay.addView(label("Coordenada Y")); lay.addView(etY)
+                  lay.addView(label("Duracion de la pulsacion (milisegundos)")); lay.addView(etMs)
+                  val sv = ScrollView(this).apply { addView(lay) }
+                  MaterialAlertDialogBuilder(this).setTitle("Pulsación larga").setView(sv).setPositiveButton("Agregar") { _, _ ->
+                      val x = etX.text.toString().toFloatOrNull()
+                      val y = etY.text.toString().toFloatOrNull()
+                      if (x == null || y == null) { toast("Faltan coordenadas"); return@setPositiveButton }
+                      val ms = etMs.text.toString().toIntOrNull()?.takeIf { it > 0 } ?: 1000
+                      flow.steps.add(Step(type = "LONG_TAP", label = etLabel.text.toString().ifBlank { "Pulsacion larga" }, x = x, y = y, durationMs = ms))
+                      saveFlows()
+                      buildUi()
+                  }.setNegativeButton("Cancelar", null).show()
+              }
+
+              private fun showAddSwipeDialog(flow: Flow) {
+                  val lay = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(16), dp(8), dp(16), dp(8)) }
+                  val etLabel = edit("Etiqueta", "Deslizar")
+                  val etX = edit("X inicial", "", numeric = true)
+                  val etY = edit("Y inicial", "", numeric = true)
+                  val etX2 = edit("X final", "", numeric = true)
+                  val etY2 = edit("Y final", "", numeric = true)
+                  val etMs = edit("Milisegundos", "400", numeric = true)
+                  lay.addView(label("Etiqueta")); lay.addView(etLabel)
+                  lay.addView(label("X inicial")); lay.addView(etX)
+                  lay.addView(label("Y inicial")); lay.addView(etY)
+                  lay.addView(label("X final")); lay.addView(etX2)
+                  lay.addView(label("Y final")); lay.addView(etY2)
+                  lay.addView(label("Duracion del deslizamiento (ms)")); lay.addView(etMs)
+                  val sv = ScrollView(this).apply { addView(lay) }
+                  MaterialAlertDialogBuilder(this).setTitle("Deslizar").setView(sv).setPositiveButton("Agregar") { _, _ ->
+                      val x = etX.text.toString().toFloatOrNull()
+                      val y = etY.text.toString().toFloatOrNull()
+                      val x2 = etX2.text.toString().toFloatOrNull()
+                      val y2 = etY2.text.toString().toFloatOrNull()
+                      if (x == null || y == null || x2 == null || y2 == null) { toast("Faltan coordenadas"); return@setPositiveButton }
+                      val ms = etMs.text.toString().toIntOrNull()?.takeIf { it > 0 } ?: 400
+                      flow.steps.add(Step(type = "SWIPE", label = etLabel.text.toString().ifBlank { "Deslizar" }, x = x, y = y, x2 = x2, y2 = y2, durationMs = ms))
+                      saveFlows()
+                      buildUi()
+                  }.setNegativeButton("Cancelar", null).show()
+              }
+
+              private fun showAddPauseDialog(flow: Flow) {
+                  val lay = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(16), dp(8), dp(16), dp(8)) }
+                  val etSec = edit("Segundos", "60", numeric = true)
+                  lay.addView(label("Segundos de espera")); lay.addView(etSec)
+                  MaterialAlertDialogBuilder(this).setTitle("Agregar Espera").setView(lay).setPositiveButton("Agregar") { _, _ ->
+                      val sec = etSec.text.toString().toIntOrNull() ?: 5
+                      flow.steps.add(Step(type = "PAUSE", label = "Esperar ${sec}s", seconds = sec))
+                      saveFlows()
+                      buildUi()
+                  }.setNegativeButton("Cancelar", null).show()
+              }
+
+              private fun showAddDownloadDialog(flow: Flow) {
+                  val lay = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(16), dp(8), dp(16), dp(8)) }
+                  val etX = edit("X", "", numeric = true)
+                  val etY = edit("Y", "", numeric = true)
+                  lay.addView(label("Coordenada X del boton descargar")); lay.addView(etX)
+                  lay.addView(label("Coordenada Y")); lay.addView(etY)
+                  MaterialAlertDialogBuilder(this).setTitle("Descargar y Renombrar").setView(lay).setPositiveButton("Agregar") { _, _ ->
+                      val x = etX.text.toString().toFloatOrNull()
+                      val y = etY.text.toString().toFloatOrNull()
+                      if (x == null || y == null) { toast("Faltan coordenadas"); return@setPositiveButton }
+                      flow.steps.add(Step(type = "DOWNLOAD_RENAME", label = "Descargar y Renombrar a numero", x = x, y = y))
+                      saveFlows()
+                      buildUi()
+                  }.setNegativeButton("Cancelar", null).show()
+              }
+
+              private fun showEditStepDialog(flow: Flow, step: Step) {
+                  if (step.type == "WRITE_PROMPT") {
+                      showPromptDialog(flow)
+                      return
+                  }
+                  val lay = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(16), dp(8), dp(16), dp(8)) }
+                  val etLabel = edit("Etiqueta", step.label)
+                  val etX = edit("X", step.x?.toString() ?: "", numeric = true)
+                  val etY = edit("Y", step.y?.toString() ?: "", numeric = true)
+                  val etX2 = edit("X final", step.x2?.toString() ?: "", numeric = true)
+                  val etY2 = edit("Y final", step.y2?.toString() ?: "", numeric = true)
+                  val etMs = edit("Milisegundos", step.durationMs?.toString() ?: "", numeric = true)
+                  val etSec = edit("Segundos", step.seconds?.toString() ?: "", numeric = true)
+                  lay.addView(label("Etiqueta")); lay.addView(etLabel)
+                  if (step.type == "TAP" || step.type == "DOWNLOAD_RENAME" || step.type == "LONG_TAP" || step.type == "SWIPE") {
+                      lay.addView(label(if (step.type == "SWIPE") "X inicial" else "X")); lay.addView(etX)
+                      lay.addView(label(if (step.type == "SWIPE") "Y inicial" else "Y")); lay.addView(etY)
+                  }
+                  if (step.type == "SWIPE") {
+                      lay.addView(label("X final")); lay.addView(etX2)
+                      lay.addView(label("Y final")); lay.addView(etY2)
+                  }
+                  if (step.type == "LONG_TAP" || step.type == "SWIPE" || step.type == "LONG_TAP_DYNAMIC_IMAGE") {
+                      lay.addView(label("Milisegundos")); lay.addView(etMs)
+                  }
+                  if (step.type == "PAUSE") {
+                      lay.addView(label("Segundos")); lay.addView(etSec)
+                  }
+                  val sv = ScrollView(this).apply { addView(lay) }
+                  MaterialAlertDialogBuilder(this).setTitle("Editar paso").setView(sv).setPositiveButton("Guardar") { _, _ ->
+                      val idx = flow.steps.indexOf(step)
+                      if (idx >= 0) {
+                          val newSec = etSec.text.toString().toIntOrNull() ?: step.seconds
+                          var newLabel = etLabel.text.toString().ifBlank { step.label }
+                          if (step.type == "PAUSE" && newSec != null && newLabel == step.label && newSec != step.seconds) {
+                              newLabel = "Esperar ${newSec}s"
+                          }
+                          val newStep = step.copy(
+                              label = newLabel,
+                              x = etX.text.toString().toFloatOrNull() ?: step.x,
+                              y = etY.text.toString().toFloatOrNull() ?: step.y,
+                              seconds = newSec,
+                              x2 = etX2.text.toString().toFloatOrNull() ?: step.x2,
+                              y2 = etY2.text.toString().toFloatOrNull() ?: step.y2,
+                              durationMs = etMs.text.toString().toIntOrNull()?.takeIf { it > 0 } ?: step.durationMs
+                          )
+                          flow.steps[idx] = newStep
+                          saveFlows()
+                          buildUi()
+                      }
+                  }.setNegativeButton("Cancelar", null).show()
+              }
+
+              private fun hasStorage(): Boolean =
+                  if (Build.VERSION.SDK_INT >= 30) Environment.isExternalStorageManager()
+                  else checkSelfPermission(Manifest.permission.WRITE_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED
+
+              private fun askStorage() {
+                  if (Build.VERSION.SDK_INT >= 30) {
+                      try {
+                          startActivity(Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION, Uri.parse("package:$packageName")))
+                      } catch (e: Exception) {
+                          startActivity(Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION))
+                      }
+                  } else {
+                      requestPermissions(arrayOf(Manifest.permission.WRITE_EXTERNAL_STORAGE, Manifest.permission.READ_EXTERNAL_STORAGE), 1)
+                  }
+              }
+
+              private fun askAccessibility() {
+                  startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+              }
+
+              private fun showLog() {
+                  val tv = TextView(this).apply {
+                      text = Logger.read().ifEmpty { "(vacio)" }
+                      setTextColor(Color.WHITE)
+                      textSize = 12f
+                      setPadding(dp(12), dp(12), dp(12), dp(12))
+                      setTextIsSelectable(true)
+                  }
+                  val sv = ScrollView(this).apply {
+                      setBackgroundColor(Color.parseColor("#121212"))
+                      addView(tv)
+                  }
+                  MaterialAlertDialogBuilder(this)
+                      .setTitle("Registro")
+                      .setView(sv)
+                      .setPositiveButton("Cerrar", null)
+                      .setNeutralButton("Copiar") { _, _ ->
+                          val cm = getSystemService(CLIPBOARD_SERVICE) as ClipboardManager
+                          cm.setPrimaryClip(ClipData.newPlainText("registro", Logger.read()))
+                          toast("Copiado")
+                      }
+                      .setNegativeButton("Borrar") { _, _ -> Logger.clear() }
+                      .show()
+              }
+
+              private fun executeFlow(flow: Flow) {
+                  saveFlows()
+                  val svc = ClickService.instance
+                  if (svc == null) {
+                      toast("Primero activa accesibilidad")
+                      askAccessibility()
+                      return
+                  }
+                  if (!hasStorage()) {
+                      toast("Falta permiso de archivos")
+                      askStorage()
+                      return
+                  }
+                  if (flow.steps.isEmpty()) {
+                      toast("El flujo no tiene pasos")
+                      return
+                  }
+                  if (parsePromptList(flow.promptList()).isEmpty()) {
+                      toast("Agrega el paso Prompt con tu lista (1. texto)")
+                      return
+                  }
+                  if (!File(flow.folder).isDirectory) {
+                      toast("Carpeta no existe: ${flow.folder}")
+                      return
+                  }
+                  if (!svc.startFlow(flow)) return
+                  if (flow.useFloatingButton) {
+                      toast("Flujo ${flow.name}: aparecieron ▶ PLAY y ■ DETENER. Abre la IA y pulsa PLAY")
+                  } else {
+                      toast("Flujo ${flow.name} empieza en ${flow.waitBeforeStart}s. Abre la IA. Para parar: ■ DETENER")
+                  }
+                  moveTaskToBack(true)
+              }
+
+              private fun toast(m: String) = Toast.makeText(this, m, Toast.LENGTH_LONG).show()
+          }
+          FIN_ARCHIVO_4
+          mkdir -p "$(dirname 'app/src/main/java/com/autoprompter/Models.kt')"
+          cat > 'app/src/main/java/com/autoprompter/Models.kt' <<'FIN_ARCHIVO_5'
+          package com.autoprompter
+
+          import java.util.UUID
+
+          data class Prompt(val num: Int, val text: String)
+
+          // Todos los campos tienen valor por defecto: asi Kotlin genera un constructor sin argumentos
+          // y Gson aplica esos valores a los campos que falten en datos guardados con versiones anteriores.
+          data class Step(
+              val id: String = UUID.randomUUID().toString(),
+              val type: String = "", // TAP, LONG_TAP, SWIPE, WRITE_PROMPT, PAUSE, DOWNLOAD_RENAME, TAP_DYNAMIC_IMAGE, LONG_TAP_DYNAMIC_IMAGE
+              val label: String = "",
+              val x: Float? = null,
+              val y: Float? = null,
+              val seconds: Int? = null,
+              val text: String? = null,
+              val x2: Float? = null,
+              val y2: Float? = null,
+              val durationMs: Int? = null
+          )
+
+          data class Flow(
+              val id: String = UUID.randomUUID().toString(),
+              var name: String = "",
+              var folder: String = "/storage/emulated/0/Download",
+              var promptsRaw: String = "",
+              var steps: MutableList<Step> = mutableListOf(),
+              var waitBeforeStart: Int = 15,
+              var useFloatingButton: Boolean = true,
+              var typingDelayMs: Int = 50
+          ) {
+              fun promptList(): String {
+                  val s = steps.firstOrNull { it.type == "WRITE_PROMPT" && !it.text.isNullOrBlank() }
+                  return s?.text ?: promptsRaw
+              }
+          }
+
+          fun parsePromptList(text: String): List<Prompt> {
+              val re = Regex("^\\s*(\\d+)\\s*\\.\\s*(.*)$")
+              val out = mutableListOf<Prompt>()
+              var num = -1
+              val sb = StringBuilder()
+              fun flush() {
+                  if (num >= 0 && sb.isNotBlank()) out.add(Prompt(num, sb.toString().trim()))
+                  sb.setLength(0)
+              }
+              for (line in text.lines()) {
+                  val m = re.find(line)
+                  if (m != null) {
+                      flush()
+                      num = m.groupValues[1].toIntOrNull() ?: -1
+                      sb.append(m.groupValues[2])
+                  } else if (line.isNotBlank() && num >= 0) {
+                      sb.append(' ').append(line.trim())
+                  }
+              }
+              flush()
+              return out
+          }
+          FIN_ARCHIVO_5
+          mkdir -p "$(dirname 'app/src/main/res/values/strings.xml')"
+          cat > 'app/src/main/res/values/strings.xml' <<'FIN_ARCHIVO_6'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <string name="app_name">Auto Prompts 2.3</string>
+              <string name="service_desc">Automatiza toques y escribe prompts con flujos personalizables.</string>
+          </resources>
+          FIN_ARCHIVO_6
+          mkdir -p "$(dirname 'app/src/main/res/values/themes.xml')"
+          cat > 'app/src/main/res/values/themes.xml' <<'FIN_ARCHIVO_7'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <style name="AppTheme" parent="Theme.Material3.DayNight.NoActionBar">
+                  <item name="colorPrimary">#4CAF50</item>
+                  <item name="android:windowBackground">#121212</item>
+                  <item name="android:statusBarColor">#121212</item>
+                  <item name="android:navigationBarColor">#121212</item>
+              </style>
+          </resources>
+          FIN_ARCHIVO_7
+          mkdir -p "$(dirname 'app/src/main/res/xml/accessibility_config.xml')"
+          cat > 'app/src/main/res/xml/accessibility_config.xml' <<'FIN_ARCHIVO_8'
+          <?xml version="1.0" encoding="utf-8"?>
+          <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+              android:accessibilityEventTypes="typeWindowStateChanged"
+              android:accessibilityFeedbackType="feedbackGeneric"
+              android:accessibilityFlags="flagDefault|flagIncludeNotImportantViews"
+              android:canPerformGestures="true"
+              android:canRetrieveWindowContent="true"
+              android:description="@string/service_desc"
+              android:notificationTimeout="100" />
+          FIN_ARCHIVO_8
+          mkdir -p "$(dirname 'build.gradle.kts')"
+          cat > 'build.gradle.kts' <<'FIN_ARCHIVO_9'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          FIN_ARCHIVO_9
+          mkdir -p "$(dirname 'gradle.properties')"
+          cat > 'gradle.properties' <<'FIN_ARCHIVO_10'
+          org.gradle.jvmargs=-Xmx2g -Dfile.encoding=UTF-8
+          android.nonTransitiveRClass=true
+          android.useAndroidX=true
+          FIN_ARCHIVO_10
+          mkdir -p "$(dirname 'settings.gradle.kts')"
+          cat > 'settings.gradle.kts' <<'FIN_ARCHIVO_11'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "AutoPrompts"
+          include(":app")
+          FIN_ARCHIVO_11
+
+      - name: Aceptar licencias del SDK
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+
+      - name: Compilar
+        run: |
+          gradle clean assembleDebug --no-daemon --stacktrace
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AutoPrompts2-APK
+          path: app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
